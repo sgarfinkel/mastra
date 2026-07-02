@@ -1,5 +1,135 @@
 # @mastra/pg
 
+## 1.15.0-alpha.1
+
+### Patch Changes
+
+- Added optional tenancy arguments to `getDataset`, `updateDataset`, and `deleteDataset`. ([#18750](https://github.com/mastra-ai/mastra/pull/18750))
+
+  You can now pass `organizationId` and `projectId` to scope dataset reads, updates, and deletes to a specific tenant. Reads and updates against a dataset in a different tenant throw `DATASET_NOT_FOUND` (surfaced as a 404 over HTTP). Deletes silently no-op on a tenancy mismatch — matching the existing "delete non-existent id is a no-op" semantics so cross-tenant existence is never leaked via error timing or status.
+
+  **Example**
+
+  ```ts
+  // Before
+  await client.getDataset('abc123');
+  await client.deleteDataset('abc123');
+  await client.updateDataset({ id: 'abc123', name: 'renamed' });
+
+  // After — scope to a tenant
+  await client.getDataset('abc123', { organizationId: 'org_a', projectId: 'proj_1' });
+  await client.deleteDataset('abc123', { organizationId: 'org_a' });
+  await client.updateDataset({ id: 'abc123', name: 'renamed', organizationId: 'org_a' });
+  ```
+
+  Related: [MASTRA-4438](https://linear.app/kepler-crm/issue/MASTRA-4438)
+
+- Pushed remaining dataset read filters and pagination down to storage. ([#18710](https://github.com/mastra-ai/mastra/pull/18710))
+
+  `DatasetsManager.list({ filters })` now accepts `targetType`, `targetIds` (overlap/union semantics), and `name` (substring, case-insensitive) in addition to the existing tenancy and candidate filters. Filtering is pushed down to the storage layer so callers no longer have to post-filter results.
+
+  Storage adapters must also be upgraded to the versions listed below to honor the new filters. If a caller is on this version of `@mastra/core` but on an older storage adapter, the new `targetType`/`targetIds`/`name` filter keys are silently ignored by the adapter — no runtime error, but the filter has no effect and every dataset in the tenancy is returned.
+
+  `Dataset.listItems({ version, search, page, perPage })` now applies `search` and pagination at the storage layer when `version` is provided alongside any of those. Previously they were silently dropped whenever `version` was set. The return shape is unchanged: passing only `version` still returns a bare `DatasetItem[]` snapshot; passing `search`, `page`, or `perPage` (with or without `version`) returns the paginated `{ items, pagination }` shape. The bare-array branch is marked `@deprecated`; prefer passing `page` / `perPage` to always receive the paginated shape.
+
+- Fixed a double-encoding bug where `createDataset` and `updateDataset` stored `targetIds` and `scorerIds` as JSON-encoded strings into the `JSONB` columns instead of arrays. This caused the new `listDatasets({ filters: { targetIds } })` overlap query (`targetIds ?| array[...]`) to never match. ([#18710](https://github.com/mastra-ai/mastra/pull/18710))
+
+  Existing rows written before this fix are still double-encoded and will not be matched by the new `targetIds` filter. They self-heal on the next `updateDataset` call. Deployments with a long tail of pre-existing datasets should run a one-time backfill (re-encoding `targetIds` and `scorerIds` on affected rows) rather than rely on incidental writes; this can be tracked as a follow-up if needed.
+
+- Fixed a cross-tenant data-access issue on datasets by scoping `DatasetsManager.get` and `DatasetsManager.delete` to tenancy filters. ([#18750](https://github.com/mastra-ai/mastra/pull/18750))
+
+  Previously `get({ id })` and `delete({ id })` looked up a dataset by its primary key alone. Any caller who knew a dataset id could read or delete it regardless of which `organizationId` / `projectId` it belonged to. This is now closed at the storage layer via a scoped SQL predicate (option (a) — no fetch-then-assert).
+
+  **What changed**
+  - `DatasetsManager.get` and `DatasetsManager.delete` accept optional `organizationId` and `projectId`.
+  - The tenancy is stashed on the returned `Dataset` handle and forwarded to every downstream storage call (`getDetails`, `update`, `addItem`, item batch ops, `startExperimentAsync`).
+  - The abstract storage contract (`getDatasetById`, `deleteDataset`) gained an optional `filters?: DatasetTenancyFilters` arg.
+  - Item-mutation inputs (`AddDatasetItemInput`, `UpdateDatasetItemInput`, `BatchInsertItemsInput`, `BatchDeleteItemsInput`) and `UpdateDatasetInput` accept optional `filters` for the internal existence check.
+
+  **Behavior**
+  - Omitting tenancy preserves the existing behavior (no predicate added) — fully backwards compatible.
+  - On tenancy mismatch, `get` throws NOT_FOUND (returns null at the storage layer) and `delete` is a silent no-op — matching how a missing id already behaves, so existence does not leak through error timing or messages.
+
+  **Example**
+
+  ```ts
+  // Before
+  const ds = await mastra.datasets.get({ id });
+  await mastra.datasets.delete({ id });
+
+  // After — scope to a tenant
+  const ds = await mastra.datasets.get({ id, organizationId, projectId });
+  await mastra.datasets.delete({ id, organizationId, projectId });
+  ```
+
+  Related: [MASTRA-4438](https://linear.app/kepler-crm/issue/MASTRA-4438)
+
+- Add optional `batchId`, `datasetId`, and `datasetItemId` fields to persisted scores so saved baseline scores can be grouped as one scoring pass and joined back to the dataset items they came from. ([#18331](https://github.com/mastra-ai/mastra/pull/18331))
+  - `scoreTrace()` accepts top-level `batchId`, `datasetId`, and `datasetItemId` when persisting a score for a stored trace.
+  - `ScoreRowData` and score save payloads now include nullable `batchId`, `datasetId`, and `datasetItemId`.
+  - Built-in stores with explicit score schema or attribute mappings now persist these provenance fields on saved scores.
+  - D1, DSQL, MSSQL, and Upstash score stores now apply additive provenance migrations or deterministic score ordering for persisted score reads.
+
+  ```ts
+  await scoreTrace({
+    storage,
+    scorer,
+    target: { traceId },
+    batchId: 'baseline-batch-1',
+    datasetId,
+    datasetItemId,
+  });
+  ```
+
+- Added multi-tenant scoping to stored scorer definitions. Stored scorers now persist optional `organizationId` and `projectId` on the definition record, and `list`/`listResolved` accept matching filters to scope results by tenant. The Postgres adapter backfills the new columns and applies the scoped filters; tenancy lives on the record while version snapshots stay pure config. ([#18331](https://github.com/mastra-ai/mastra/pull/18331))
+
+  ```ts
+  await storage.create({
+    scorerDefinition: { id, organizationId: 'org-a', projectId: 'proj-1', ...config },
+  });
+
+  const { scorerDefinitions } = await storage.list({
+    status: 'draft',
+    organizationId: 'org-a',
+    projectId: 'proj-1',
+  });
+  ```
+
+- Added optional `organizationId` and `projectId` fields to scores for multi-tenant isolation. Scores can now be saved with tenancy metadata and the `listScoresBy*` methods accept a `filters` option to scope results by organization and project. ([#18331](https://github.com/mastra-ai/mastra/pull/18331))
+
+  ```ts
+  await storage.saveScore({ ...score, organizationId: 'org-a', projectId: 'proj-1' });
+
+  const result = await storage.listScoresByScorerId({
+    scorerId,
+    filters: { organizationId: 'org-a', projectId: 'proj-1' },
+  });
+  ```
+
+  `projectId` identifies the project scope, separate from `resourceId` which continues to mean the agent memory resource.
+
+- Scoped `getDatasetById` and `deleteDataset` to tenancy filters when the caller passes `organizationId` / `projectId`. ([#18750](https://github.com/mastra-ai/mastra/pull/18750))
+
+  The adapters now push the tenancy predicate into the SQL/query when the new optional `filters` argument is present. Legacy calls that omit tenancy are unchanged. On mismatch, `getDatasetById` returns `null` and `deleteDataset` is a silent no-op — the cascade delete (dataset items and versions) is gated by a scoped parent pre-check, so cross-tenant data is never touched.
+
+  Related: [MASTRA-4438](https://linear.app/kepler-crm/issue/MASTRA-4438)
+
+- Added optional `organizationId` and `projectId` query parameters to the dataset routes. ([#18750](https://github.com/mastra-ai/mastra/pull/18750))
+
+  `GET /datasets/:datasetId`, `PATCH /datasets/:datasetId`, and `DELETE /datasets/:datasetId` now accept optional tenancy query parameters. When provided, they are forwarded to `mastra.datasets.get` / `.delete` and the operation returns 404 if the dataset does not belong to the requested tenant. Requests that omit the query parameters keep their existing behavior.
+
+  **Example**
+
+  ```
+  GET /datasets/abc123?organizationId=org_a&projectId=proj_1
+  DELETE /datasets/abc123?organizationId=org_a
+  ```
+
+  Related: [MASTRA-4438](https://linear.app/kepler-crm/issue/MASTRA-4438)
+
+- Updated dependencies [[`9250acd`](https://github.com/mastra-ai/mastra/commit/9250acd1357f0f1f33d0dcca16f9655084c58eca), [`215f9b0`](https://github.com/mastra-ai/mastra/commit/215f9b0f3f3f6fc165edad360582dd4d3d7ea748), [`c64c2a8`](https://github.com/mastra-ai/mastra/commit/c64c2a8503a50252f9ca6b8e8c54cadee31b92a2), [`215f9b0`](https://github.com/mastra-ai/mastra/commit/215f9b0f3f3f6fc165edad360582dd4d3d7ea748), [`24c10d3`](https://github.com/mastra-ai/mastra/commit/24c10d333e6649ac06075903aeeee13a933db3b3), [`24c10d3`](https://github.com/mastra-ai/mastra/commit/24c10d333e6649ac06075903aeeee13a933db3b3), [`24c10d3`](https://github.com/mastra-ai/mastra/commit/24c10d333e6649ac06075903aeeee13a933db3b3), [`24c10d3`](https://github.com/mastra-ai/mastra/commit/24c10d333e6649ac06075903aeeee13a933db3b3), [`215f9b0`](https://github.com/mastra-ai/mastra/commit/215f9b0f3f3f6fc165edad360582dd4d3d7ea748), [`215f9b0`](https://github.com/mastra-ai/mastra/commit/215f9b0f3f3f6fc165edad360582dd4d3d7ea748)]:
+  - @mastra/core@1.49.0-alpha.5
+
 ## 1.15.0-alpha.0
 
 ### Minor Changes
